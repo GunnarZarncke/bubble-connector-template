@@ -15,9 +15,7 @@ cd bubble_connector
 
 3. **Open in an agent-enabled IDE** (e.g. [VS Code](https://code.visualstudio.com/) with GitHub
    Copilot, [Cursor](https://cursor.com/), or similar). Open the cloned folder as the workspace.
-4. Tell the agent:
-
-> Read `AGENT_INSTRUCTIONS.md` and follow it.
+4. Chat with your agent. It will know how it works, what to do when you ask it to save/share something. 
 
 All setup steps — placeholders, participants, git remotes, privacy — are in that file.
 
