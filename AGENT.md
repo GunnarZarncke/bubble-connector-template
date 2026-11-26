@@ -7,9 +7,9 @@ knowledge base — folder layout, LOG/SUMMARY convention, git workflow, and priv
 
 ## Extend this file (optional)
 
-Add project- or group-specific rules below. Keep Bubble Connector behavior in
-`AGENT_INSTRUCTIONS.md`; use this file for how the agent should work in general (coding style,
-verification, scope discipline).
+Add project-specific rules below. The project may be one person's or a shared one. Keep Bubble
+Connector behavior in `AGENT_INSTRUCTIONS.md`; use this file for how the agent should work in
+general (coding style, verification, scope discipline).
 
 **Suggested starting point — Karpathy's four principles** (from
 [Andrej Karpathy's observations on LLM coding pitfalls](https://x.com/karpathy/status/2015883857489522876);
@@ -21,3 +21,18 @@ packaged e.g. in [andrej-karpathy-skills](https://github.com/jason-wjs/andrej-ka
 4. **Goal-driven execution** — define success criteria; loop until verified (e.g. tests pass).
 
 <!-- Paste or adapt Karpathy-style guidelines here when you extend this file. -->
+
+## Fork decisions
+
+<!-- The agent fills this section in only after the owner answers.
+     Until the answers are written here, ask before changing these instructions
+     and before the first kx create, kx publish, or kx add-reader.
+
+     Record:
+     - Which instructions the owner changed
+     - Whether import and refresh may push (template default: commit locally and do not push)
+     - What may be placed in knowledge-export, and what must never be exported
+     - Whether imported knowledge may be republished, and to which audiences
+     - Whether each publication needs a fresh explicit request
+     - How imports should be refreshed and used
+-->

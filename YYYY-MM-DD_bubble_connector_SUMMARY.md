@@ -4,16 +4,17 @@
 
 ## What this is
 
-Shared knowledge base for **<GROUP_NAME>**. Each participant has a `users/<slug>/` folder;
-`SYNTHESIS.md` surfaces connections between people.
+Private knowledge base for **<PROJECT_NAME>**. Shareable feeds live in `knowledge-export/`.
+Other people's feeds are submodules under `knowledge-import/`. `SYNTHESIS.md` relates them.
 
 ## Current status
 
 - **Created:** YYYY-MM-DD from the Bubble Connector template.
-- **Maintainer:** <MAINTAINER>
-- **Participants:** (list slugs as people join)
+- **Owner:** <OWNER>
+- **Feeds:** `general` (example — replace before publishing)
+- **Imports:** (none yet)
 
 ## Open questions
 
-- Who else should be invited?
+- Who may read each feed?
 - Where is the canonical git remote? `<REMOTE_URL>`

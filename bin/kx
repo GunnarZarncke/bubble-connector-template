@@ -1,0 +1,796 @@
+#!/usr/bin/env bash
+# Publish and subscribe to knowledge feeds.
+# Publication commits are built with git commit-tree from knowledge-export/<feed>
+# and pushed only to the kx-export-<feed> remote. Import remotes are never pushed.
+set -euo pipefail
+
+unset CDPATH
+export GIT_TERMINAL_PROMPT=0
+
+ZERO_OID="0000000000000000000000000000000000000000"
+
+die() {
+  echo "kx: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  kx create <feed> [reader...] [--owner <owner>] [--visibility private|public|internal] [--url <git-url>]
+  kx publish <feed> [--message <text>] [--confirm-remote <full-sha>]
+  kx import <publisher> <feed> [--url <git-url>]
+  kx refresh --all
+  kx refresh <publisher> [feed]
+  kx add-reader <feed> <user>
+
+kx import and kx refresh commit in the private repository and do not push it.
+EOF
+}
+
+require_git_repo() {
+  REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "Not inside a Git repository."
+  cd "$REPO_ROOT"
+}
+
+require_identity() {
+  git var GIT_AUTHOR_IDENT >/dev/null 2>&1 || die "Git user.name and user.email must be configured before creating commits."
+}
+
+validate_component() {
+  local name=$1 kind=$2
+  if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$ ]]; then
+    die "Invalid ${kind} '${name}'. Use letters, numbers, dots, underscores, and hyphens."
+  fi
+  case "$name" in
+    *..*|*.|*@|*.lock)
+      die "Invalid ${kind} '${name}'."
+      ;;
+  esac
+}
+
+validate_reader() {
+  local name=$1
+  if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]]; then
+    die "Invalid reader '${name}'."
+  fi
+}
+
+validate_full_sha() {
+  local sha=$1
+  if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ && ! "$sha" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    die "Pass the full publication SHA (not an abbreviation)."
+  fi
+}
+
+# Sets PARSED_STYLE, PARSED_HOST, PARSED_OWNER, PARSED_REPO.
+parse_git_url() {
+  local url=$1 rest host path
+  PARSED_STYLE=""
+  PARSED_HOST=""
+  PARSED_OWNER=""
+  PARSED_REPO=""
+  url=${url%.git}
+  url=${url%/}
+  if [[ "$url" == git@*:* && "$url" != ssh://* ]]; then
+    PARSED_STYLE=ssh
+    rest=${url#git@}
+    host=${rest%%:*}
+    path=${rest#*:}
+  elif [[ "$url" == ssh://* ]]; then
+    PARSED_STYLE=ssh
+    rest=${url#ssh://}
+    rest=${rest#git@}
+    host=${rest%%/*}
+    host=${host%%:*}
+    path=${rest#*/}
+  elif [[ "$url" == https://* || "$url" == http://* ]]; then
+    PARSED_STYLE=https
+    rest=${url#*://}
+    host=${rest%%/*}
+    host=${host%%:*}
+    path=${rest#*/}
+  else
+    PARSED_STYLE=other
+    return 1
+  fi
+  PARSED_HOST=$host
+  PARSED_OWNER=${path%%/*}
+  PARSED_REPO=${path#*/}
+  if [[ -z "$PARSED_HOST" || -z "$PARSED_OWNER" || -z "$PARSED_REPO" || "$PARSED_OWNER" == "$PARSED_REPO" ]]; then
+    PARSED_STYLE=other
+    return 1
+  fi
+  return 0
+}
+
+publication_url_for() {
+  local style=$1 host=$2 owner=$3 repo=$4
+  case "$style" in
+    ssh) printf 'git@%s:%s/%s.git\n' "$host" "$owner" "$repo" ;;
+    https) printf 'https://%s/%s/%s.git\n' "$host" "$owner" "$repo" ;;
+    *) return 1 ;;
+  esac
+}
+
+load_origin() {
+  local url
+  url=$(git config --get remote.origin.url 2>/dev/null) || die "No origin remote. Add one, or pass --url for an existing repository."
+  parse_git_url "$url" || die "Cannot infer a host and owner from origin (${url}). Pass --url for an existing repository."
+}
+
+remote_name_for() {
+  printf 'kx-export-%s\n' "$1"
+}
+
+ref_for() {
+  printf 'refs/kx/published/%s\n' "$1"
+}
+
+export_path_for() {
+  printf 'knowledge-export/%s\n' "$1"
+}
+
+gh_available() {
+  command -v gh >/dev/null 2>&1
+}
+
+# GitHub.com, or a host the installed gh is already authenticated for.
+host_uses_gh() {
+  local host=$1
+  if [[ "$host" == "github.com" ]]; then
+    return 0
+  fi
+  if gh_available && GH_PROMPT_DISABLED=1 GH_HOST="$host" gh auth status --hostname "$host" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+gh_cmd() {
+  local host=$1
+  shift
+  gh_available || die "The GitHub CLI (gh) is not available. Install gh and run 'gh auth login', or create an empty repository yourself and pass --url."
+  GH_PROMPT_DISABLED=1 GH_HOST="$host" gh "$@"
+}
+
+manual_provision_help() {
+  local feed=$1
+  cat >&2 <<EOF
+kx: This host has no automated repository provisioning.
+Create an empty repository named knowledge-${feed} with no README, license, or initial commit.
+Then run:
+  git remote add kx-export-${feed} <git-url>
+  kx publish ${feed}
+Grant readers access on that host. Adding a reader exposes the repository's existing history.
+EOF
+}
+
+ensure_export_committed() {
+  local feed=$1
+  local export
+  export=$(export_path_for "$feed")
+  if [[ ! -d "$export" ]]; then
+    die "Missing export directory ${export}."
+  fi
+  local kind
+  if ! kind=$(git cat-file -t "HEAD:${export}" 2>/dev/null); then
+    die "Commit ${export} before publishing. Uncommitted files are not published."
+  fi
+  if [[ "$kind" != "tree" ]]; then
+    die "${export} is not a directory in HEAD."
+  fi
+  local dirty
+  dirty=$(git status --porcelain --untracked-files=all -- "$export")
+  if [[ -n "$dirty" ]]; then
+    die "Export directory has uncommitted changes. Commit them before publishing."
+  fi
+}
+
+validate_export_tree() {
+  local tree=$1
+  local line mode rest type sha path base header
+  while IFS= read -r -d '' line; do
+    [[ -n "$line" ]] || continue
+    mode=${line%% *}
+    rest=${line#* }
+    type=${rest%% *}
+    rest=${rest#* }
+    sha=${rest%%$'\t'*}
+    path=${rest#*$'\t'}
+    case "$mode" in
+      100644|100755) ;;
+      120000) die "Export contains a symlink (${path})." ;;
+      160000) die "Export contains a gitlink (${path})." ;;
+      *) die "Export contains an unsupported entry (${mode} ${path})." ;;
+    esac
+    if [[ "$type" != "blob" ]]; then
+      die "Export contains an unexpected ${type} (${path})."
+    fi
+    base=${path##*/}
+    case "$base" in
+      .env|.env.*|credentials.json|credentials.*|id_rsa|id_dsa|id_ed25519|id_ecdsa|*.pem|*.p12|*.pfx)
+        die "Export contains a disallowed file (${path})."
+        ;;
+    esac
+    case "/${path}/" in
+      */secrets/*) die "Export contains a disallowed path (${path})." ;;
+    esac
+    header=$(git cat-file blob "$sha" 2>/dev/null | head -c 80 || true)
+    case "$header" in
+      "version https://git-lfs.github.com/spec/v1"*)
+        die "Export contains a Git LFS pointer (${path})."
+        ;;
+    esac
+  done < <(git ls-tree -r -z "$tree")
+}
+
+read_remote_main() {
+  local target=$1
+  local output
+  if ! output=$(git ls-remote "$target" refs/heads/main 2>&1); then
+    die "Could not read ${target}. Check the remote URL, network, and authentication."
+  fi
+  printf '%s\n' "$output" | awk 'NR==1 {print $1}'
+}
+
+parents_of() {
+  git rev-list --parents -n 1 "$1" | awk '{ for (i = 2; i <= NF; i++) print $i }'
+}
+
+record_confirmed_publication() {
+  local feed=$1 confirm=$2 previous=$3 remote_head=$4
+  local ref parents count parent old
+  validate_full_sha "$confirm"
+  ref=$(ref_for "$feed")
+  if [[ "$confirm" != "$remote_head" ]]; then
+    die "Remote main is ${remote_head:-<absent>}, not ${confirm}."
+  fi
+  if [[ -n "$previous" && "$previous" == "$confirm" ]]; then
+    echo "Publication ref already records ${confirm}."
+    return 0
+  fi
+  git cat-file -e "${confirm}^{commit}" 2>/dev/null || die "Commit ${confirm} is not in the local repository. kx does not fetch during recovery and will not adopt a remote commit that is not already present."
+  parents=$(parents_of "$confirm")
+  if [[ -z "$parents" ]]; then
+    count=0
+    parent=""
+  else
+    count=$(printf '%s\n' "$parents" | awk 'END { print NR }')
+    parent=$parents
+  fi
+  if [[ "$count" -gt 1 ]]; then
+    die "Refusing to record ${confirm}: publication history must stay linear."
+  fi
+  if [[ -z "$previous" ]]; then
+    if [[ "$count" -ne 0 ]]; then
+      die "Refusing to record ${confirm}: the trusted publication ref is missing, and this commit is not a root publication."
+    fi
+  else
+    if [[ "$count" -ne 1 || "$parent" != "$previous" ]]; then
+      die "Refusing to record ${confirm}: it is not the direct child of the trusted publication ref."
+    fi
+  fi
+  if [[ -z "$previous" ]]; then
+    old=$ZERO_OID
+  else
+    old=$previous
+  fi
+  git update-ref "$ref" "$confirm" "$old" || die "Could not update ${ref}."
+  echo "Recorded publication ref ${confirm}."
+}
+
+abort_diverged() {
+  local feed=$1
+  echo "Publication aborted:" >&2
+  echo "Remote history differs from the trusted local history." >&2
+  echo "If the push succeeded and only the local ref update failed, confirm that SHA and run:" >&2
+  echo "  kx publish ${feed} --confirm-remote <full-sha>" >&2
+  echo "kx does not fetch or adopt any other remote commit." >&2
+  exit 1
+}
+
+publish_feed() {
+  local feed=$1 message=$2 confirm=$3
+  local export remote ref source tree previous remote_head old_tree parents new subject old
+  validate_component "$feed" "feed"
+  require_git_repo
+  export=$(export_path_for "$feed")
+  remote=$(remote_name_for "$feed")
+  ref=$(ref_for "$feed")
+  ensure_export_committed "$feed"
+  source=$(git rev-parse HEAD)
+  tree=$(git rev-parse "${source}:${export}")
+  validate_export_tree "$tree"
+  git config --get "remote.${remote}.url" >/dev/null 2>&1 || die "No remote ${remote}. Run 'kx create ${feed}' or add that remote."
+  case "$remote" in
+    kx-export-*) ;;
+    *) die "Refusing to push to unexpected remote ${remote}." ;;
+  esac
+  previous=$(git rev-parse -q --verify "$ref" 2>/dev/null || true)
+  remote_head=$(read_remote_main "$remote")
+  if [[ "$previous" != "$remote_head" ]]; then
+    if [[ -n "$confirm" ]]; then
+      record_confirmed_publication "$feed" "$confirm" "$previous" "$remote_head"
+      return 0
+    fi
+    abort_diverged "$feed"
+  fi
+  if [[ -n "$confirm" ]]; then
+    if [[ "$confirm" == "$remote_head" ]]; then
+      echo "Publication ref already matches the remote."
+      return 0
+    fi
+    die "Remote already matches the trusted ref (${previous:-<absent>}), not ${confirm}."
+  fi
+  if [[ -n "$previous" ]]; then
+    old_tree=$(git rev-parse "${previous}^{tree}")
+    if [[ "$tree" == "$old_tree" ]]; then
+      echo "No changes"
+      return 0
+    fi
+  fi
+  require_identity
+  if [[ -n "$message" ]]; then
+    subject=$message
+  else
+    subject="Publish ${feed}"
+  fi
+  subject=$(printf '%s\n' "$subject" | grep -v '^Source-Commit:' || true)
+  if [[ -z "$subject" ]]; then
+    subject="Publish ${feed}"
+  fi
+  if [[ -n "$previous" ]]; then
+    new=$(git commit-tree "$tree" -p "$previous" -m "$subject" -m "Source-Commit: ${source}")
+  else
+    new=$(git commit-tree "$tree" -m "$subject" -m "Source-Commit: ${source}")
+  fi
+  if ! git push --force-with-lease="refs/heads/main:${previous}" "$remote" "${new}:refs/heads/main"; then
+    echo "kx: Conditional push rejected. The local publication ref was not updated." >&2
+    exit 1
+  fi
+  if [[ -z "$previous" ]]; then
+    old=$ZERO_OID
+  else
+    old=$previous
+  fi
+  if ! git update-ref "$ref" "$new" "$old"; then
+    echo "kx: Push succeeded but the local publication ref was not updated." >&2
+    echo "Remote main is ${new}." >&2
+    echo "After you confirm that is the commit just pushed, run:" >&2
+    echo "  kx publish ${feed} --confirm-remote ${new}" >&2
+    exit 1
+  fi
+  echo "Published: ${new}"
+}
+
+repo_is_known() {
+  local host=$1 owner=$2 name=$3
+  gh_cmd "$host" repo view "${owner}/${name}" >/dev/null 2>&1
+}
+
+create_github_repo() {
+  local host=$1 owner=$2 name=$3 visibility=$4
+  local flag err
+  case "$visibility" in
+    private) flag=--private ;;
+    public) flag=--public ;;
+    internal) flag=--internal ;;
+    *) die "Visibility must be private, public, or internal." ;;
+  esac
+  if repo_is_known "$host" "$owner" "$name"; then
+    return 0
+  fi
+  if ! err=$(gh_cmd "$host" repo create "${owner}/${name}" "$flag" --description "Knowledge feed ${name#knowledge-}" 2>&1); then
+    if repo_is_known "$host" "$owner" "$name"; then
+      return 0
+    fi
+    echo "$err" >&2
+    die "Could not create ${owner}/${name}. If gh is not authenticated, run 'gh auth login'."
+  fi
+}
+
+ensure_publication_remote() {
+  local feed=$1 url=$2
+  local name current head previous
+  name=$(remote_name_for "$feed")
+  previous=$(git rev-parse -q --verify "$(ref_for "$feed")" 2>/dev/null || true)
+  if current=$(git config --get "remote.${name}.url" 2>/dev/null); then
+    if [[ "$current" != "$url" ]]; then
+      die "Remote ${name} already points at ${current}."
+    fi
+  else
+    head=$(read_remote_main "$url")
+    if [[ -n "$head" && "$head" != "$previous" ]]; then
+      die "Existing publication repository has history this repository did not publish. Refusing to adopt it."
+    fi
+    git remote add "$name" "$url"
+  fi
+}
+
+invite_reader() {
+  local feed=$1 user=$2
+  local remote url host owner repo nwo owner_type perm response
+  validate_component "$feed" "feed"
+  validate_reader "$user"
+  require_git_repo
+  remote=$(remote_name_for "$feed")
+  url=$(git config --get "remote.${remote}.url" 2>/dev/null) || die "No remote ${remote}."
+  parse_git_url "$url" || die "Cannot manage readers for ${url}. Grant access on that host."
+  host=$PARSED_HOST
+  owner=$PARSED_OWNER
+  repo=$PARSED_REPO
+  host_uses_gh "$host" || die "Cannot manage readers on ${host} from here. Grant access on that host. Adding a reader exposes the repository's existing history."
+  nwo="${owner}/${repo}"
+  if gh_cmd "$host" api "repos/${nwo}/collaborators/${user}" >/dev/null 2>&1; then
+    perm=$(gh_cmd "$host" api "repos/${nwo}/collaborators/${user}/permission" --jq .permission 2>/dev/null || echo "unknown")
+    echo "Reader ${user}: already has access to ${nwo} (permission: ${perm}). Access was left unchanged."
+    return 0
+  fi
+  owner_type=$(gh_cmd "$host" api "users/${owner}" --jq .type) || die "Could not tell whether ${owner} is a user or an organization."
+  if [[ "$owner_type" == "Organization" ]]; then
+    response=$(gh_cmd "$host" api -X PUT "repos/${nwo}/collaborators/${user}" -f permission=pull) || die "Could not invite ${user} to ${nwo}."
+    perm="read"
+  else
+    response=$(gh_cmd "$host" api -X PUT "repos/${nwo}/collaborators/${user}") || die "Could not invite ${user} to ${nwo}."
+    perm="write"
+  fi
+  if [[ -n "$response" ]]; then
+    echo "Reader ${user}: invited to ${nwo} (permission: ${perm}, acceptance required)."
+  else
+    echo "Reader ${user}: access updated on ${nwo} (permission: ${perm})."
+  fi
+}
+
+history_warning() {
+  echo "Adding a reader exposes the repository's existing history, not only future publications."
+}
+
+cmd_create() {
+  local feed="" visibility="private" explicit_url="" owner_override=""
+  local readers=() arg
+  while [[ $# -gt 0 ]]; do
+    arg=$1
+    shift
+    case "$arg" in
+      --owner)
+        [[ $# -gt 0 ]] || die "Missing value for --owner."
+        owner_override=$1
+        shift
+        ;;
+      --visibility)
+        [[ $# -gt 0 ]] || die "Missing value for --visibility."
+        visibility=$1
+        shift
+        ;;
+      --url)
+        [[ $# -gt 0 ]] || die "Missing value for --url."
+        explicit_url=$1
+        shift
+        ;;
+      --*) die "Unknown option ${arg}." ;;
+      *)
+        if [[ -z "$feed" ]]; then
+          feed=$arg
+        else
+          readers+=("$arg")
+        fi
+        ;;
+    esac
+  done
+  [[ -n "$feed" ]] || die "Usage: kx create <feed> [reader...]"
+  validate_component "$feed" "feed"
+  local reader
+  for reader in "${readers[@]+"${readers[@]}"}"; do
+    validate_reader "$reader"
+  done
+  case "$visibility" in
+    private|public|internal) ;;
+    *) die "Visibility must be private, public, or internal." ;;
+  esac
+  require_git_repo
+  ensure_export_committed "$feed"
+
+  local host="" owner="" pub_url="" use_gh=0 repo_name
+  repo_name="knowledge-${feed}"
+  if [[ -n "$explicit_url" ]]; then
+    pub_url=$explicit_url
+    if parse_git_url "$explicit_url"; then
+      host=$PARSED_HOST
+      owner=${owner_override:-$PARSED_OWNER}
+      if host_uses_gh "$host"; then
+        use_gh=1
+      fi
+    fi
+  else
+    load_origin
+    host=$PARSED_HOST
+    owner=${owner_override:-$PARSED_OWNER}
+    validate_component "$owner" "owner"
+    if host_uses_gh "$host"; then
+      use_gh=1
+      create_github_repo "$host" "$owner" "$repo_name" "$visibility"
+    else
+      manual_provision_help "$feed"
+      exit 1
+    fi
+    pub_url=$(publication_url_for "$PARSED_STYLE" "$host" "$owner" "$repo_name") || die "Could not build a publication URL."
+  fi
+
+  ensure_publication_remote "$feed" "$pub_url"
+  echo "Repository: ${pub_url}"
+  publish_feed "$feed" "" ""
+  if [[ ${#readers[@]} -gt 0 ]]; then
+    if [[ "$use_gh" -eq 1 ]]; then
+      for reader in "${readers[@]+"${readers[@]}"}"; do
+        invite_reader "$feed" "$reader"
+      done
+    else
+      echo "Grant access on the host for: ${readers[*]}"
+    fi
+    history_warning
+  fi
+}
+
+cmd_publish() {
+  local feed="" message="" confirm=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --message)
+        [[ $# -ge 2 ]] || die "Missing value for --message."
+        message=$2
+        shift 2
+        ;;
+      --confirm-remote)
+        [[ $# -ge 2 ]] || die "Missing value for --confirm-remote."
+        confirm=$2
+        shift 2
+        ;;
+      --*) die "Unknown option $1." ;;
+      *)
+        if [[ -n "$feed" ]]; then
+          die "Unexpected argument $1."
+        fi
+        feed=$1
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$feed" ]] || die "Usage: kx publish <feed>"
+  require_git_repo
+  publish_feed "$feed" "$message" "$confirm"
+}
+
+cmd_import() {
+  local publisher="" feed="" url=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --url)
+        [[ $# -ge 2 ]] || die "Missing value for --url."
+        url=$2
+        shift 2
+        ;;
+      --*) die "Unknown option $1." ;;
+      *)
+        if [[ -z "$publisher" ]]; then
+          publisher=$1
+        elif [[ -z "$feed" ]]; then
+          feed=$1
+        else
+          die "Unexpected argument $1."
+        fi
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$publisher" && -n "$feed" ]] || die "Usage: kx import <publisher> <feed> [--url <git-url>]"
+  validate_component "$publisher" "publisher"
+  validate_component "$feed" "feed"
+  require_git_repo
+  require_identity
+  if ! git diff --cached --quiet; then
+    die "The index has staged changes. Commit or unstage them before importing."
+  fi
+  local dest
+  dest="knowledge-import/${publisher}/${feed}"
+  if [[ -e "$dest" ]]; then
+    die "Destination ${dest} already exists."
+  fi
+  if [[ -f .gitmodules ]] && git config -f .gitmodules --get-regexp '^submodule\..*\.path$' | awk '{print $2}' | grep -Fxq "$dest"; then
+    die "Destination ${dest} is already a submodule."
+  fi
+  if [[ -z "$url" ]]; then
+    load_origin
+    url=$(publication_url_for "$PARSED_STYLE" "$PARSED_HOST" "$publisher" "knowledge-${feed}") || die "Cannot build an import URL from origin. Pass --url."
+  fi
+  mkdir -p knowledge-import
+  if [[ "$url" == /* || "$url" == file:* ]]; then
+    git -c protocol.file.allow=always submodule add -b main -- "$url" "$dest"
+  else
+    git submodule add -b main -- "$url" "$dest"
+  fi
+  git commit -m "Import knowledge from ${publisher}/${feed}" >/dev/null
+  echo "Imported ${dest}"
+  echo "Committed locally. The private repository was not pushed."
+}
+
+submodule_paths() {
+  local prefix=$1
+  local key value
+  [[ -f .gitmodules ]] || return 0
+  while read -r key value; do
+    [[ -n "${value:-}" ]] || continue
+    case "$value" in
+      "$prefix"|"$prefix"/*) printf '%s\n' "$value" ;;
+    esac
+  done < <(git config -f .gitmodules --get-regexp '^submodule\..*\.path$' || true)
+}
+
+submodule_dirty() {
+  local path=$1 head gitlink
+  if [[ ! -e "${path}/.git" ]]; then
+    return 1
+  fi
+  if [[ -n "$(git -C "$path" status --porcelain --untracked-files=all)" ]]; then
+    return 0
+  fi
+  head=$(git -C "$path" rev-parse HEAD)
+  gitlink=$(git rev-parse ":${path}" 2>/dev/null || true)
+  if [[ -n "$gitlink" && "$head" != "$gitlink" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+refresh_paths() {
+  local message=$1
+  shift
+  local path branch failed=0
+  local paths=("$@")
+  [[ ${#paths[@]} -gt 0 ]] || die "No imported feeds matched."
+  for path in "${paths[@]}"; do
+    if submodule_dirty "$path"; then
+      die "Imported submodule has local changes (${path}). Refresh refused."
+    fi
+  done
+  for path in "${paths[@]}"; do
+    if [[ ! -e "${path}/.git" ]]; then
+      if ! git submodule update --init --checkout -- "$path"; then
+        echo "kx: Import unavailable (${path}). Local submodule state preserved." >&2
+        failed=1
+        continue
+      fi
+    fi
+    branch=$(git config -f .gitmodules --get "submodule.${path}.branch" || true)
+    [[ -n "$branch" ]] || branch=main
+    if ! git -C "$path" fetch origin "$branch"; then
+      echo "kx: Import unavailable (${path}). Local submodule state preserved." >&2
+      failed=1
+    fi
+  done
+  if [[ "$failed" -ne 0 ]]; then
+    exit 1
+  fi
+  for path in "${paths[@]}"; do
+    branch=$(git config -f .gitmodules --get "submodule.${path}.branch" || true)
+    [[ -n "$branch" ]] || branch=main
+    git -C "$path" checkout --detach "origin/${branch}" >/dev/null
+    git add -- "$path"
+  done
+  if git diff --cached --quiet -- "${paths[@]}"; then
+    echo "No changes"
+    return 0
+  fi
+  require_identity
+  git commit -m "$message" >/dev/null
+  echo "Committed imported knowledge update."
+  echo "The private repository was not pushed."
+}
+
+cmd_refresh() {
+  local all=0 publisher="" feed=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all) all=1; shift ;;
+      --*) die "Unknown option $1." ;;
+      *)
+        if [[ -z "$publisher" ]]; then
+          publisher=$1
+        elif [[ -z "$feed" ]]; then
+          feed=$1
+        else
+          die "Unexpected argument $1."
+        fi
+        shift
+        ;;
+    esac
+  done
+  if [[ "$all" -eq 1 && -n "$publisher" ]]; then
+    die "Use either --all or a publisher, not both."
+  fi
+  if [[ "$all" -eq 0 && -z "$publisher" ]]; then
+    die "Usage: kx refresh --all | kx refresh <publisher> [feed]"
+  fi
+  require_git_repo
+  if ! git diff --cached --quiet; then
+    die "The index has staged changes. Commit or unstage them before refreshing imports."
+  fi
+  local prefix paths=() line message
+  if [[ "$all" -eq 1 ]]; then
+    prefix="knowledge-import"
+    message="Update imported knowledge"
+  elif [[ -n "$feed" ]]; then
+    validate_component "$publisher" "publisher"
+    validate_component "$feed" "feed"
+    prefix="knowledge-import/${publisher}/${feed}"
+    message="Update imported knowledge from ${publisher}/${feed}"
+  else
+    validate_component "$publisher" "publisher"
+    prefix="knowledge-import/${publisher}"
+    message="Update imported knowledge from ${publisher}"
+  fi
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ -n "$feed" && "$line" != "$prefix" ]]; then
+      continue
+    fi
+    paths+=("$line")
+  done < <(submodule_paths "$prefix")
+  if [[ -n "$feed" && ${#paths[@]} -eq 0 ]]; then
+    die "No submodule at ${prefix}."
+  fi
+  refresh_paths "$message" "${paths[@]+"${paths[@]}"}"
+}
+
+cmd_add_reader() {
+  local feed="" user=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --*) die "Unknown option $1." ;;
+      *)
+        if [[ -z "$feed" ]]; then
+          feed=$1
+        elif [[ -z "$user" ]]; then
+          user=$1
+        else
+          die "Unexpected argument $1."
+        fi
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$feed" && -n "$user" ]] || die "Usage: kx add-reader <feed> <user>"
+  require_git_repo
+  local before after
+  before=$(git rev-parse -q --verify "$(ref_for "$feed")" 2>/dev/null || true)
+  invite_reader "$feed" "$user"
+  after=$(git rev-parse -q --verify "$(ref_for "$feed")" 2>/dev/null || true)
+  if [[ "$before" != "$after" ]]; then
+    die "Adding a reader changed the publication ref. That should not happen."
+  fi
+  history_warning
+}
+
+main() {
+  local cmd=${1:-}
+  if [[ -z "$cmd" || "$cmd" == "-h" || "$cmd" == "--help" || "$cmd" == "help" ]]; then
+    usage
+    exit 0
+  fi
+  shift
+  case "$cmd" in
+    create) cmd_create "$@" ;;
+    publish) cmd_publish "$@" ;;
+    import) cmd_import "$@" ;;
+    refresh) cmd_refresh "$@" ;;
+    add-reader) cmd_add_reader "$@" ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
